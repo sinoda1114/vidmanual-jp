@@ -21,8 +21,15 @@ const app = express();
 const port = process.env.PORT || 3000;
 const externalApiBaseUrl = 'https://generativelanguage.googleapis.com';
 const externalWsBaseUrl = 'wss://generativelanguage.googleapis.com';
-// Support either API key env-var variant
-const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+// Support either API key env-var variant; normalize if value is "GEMINI_API_KEY=xxx" (e.g. from secret)
+let apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+if (apiKey && apiKey.includes('=')) {
+  const eq = apiKey.indexOf('=');
+  const name = apiKey.substring(0, eq).trim();
+  if (name === 'GEMINI_API_KEY' || name === 'API_KEY') {
+    apiKey = apiKey.substring(eq + 1).trim();
+  }
+}
 
 const staticPath = path.join(__dirname,'dist');
 const publicPath = path.join(__dirname,'public');
