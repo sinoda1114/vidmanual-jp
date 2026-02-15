@@ -36,86 +36,59 @@ else {
   console.log("API KEY FOUND (proxy will use this)")
 }
 
-// Limit body size to 50mb
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({extended: true, limit: '50mb'}));
-app.set('trust proxy', 1 /* number of proxies between user and server */)
+app.set('trust proxy', 1 /* number of proxies between user and server */);
 
-// Rate limiter for the proxy
+// Rate limiter for the proxy (must be before body parsers so /api-proxy gets raw body)
 const proxyLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // Set ratelimit window at 15min (in ms)
     max: 100, // Limit each IP to 100 requests per window
     message: 'Too many requests from this IP, please try again after 15 minutes',
-    standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-    legacyHeaders: false, // no `X-RateLimit-*` headers
+    standardHeaders: true,
+    legacyHeaders: false,
     handler: (req, res, next, options) => {
         console.warn(`Rate limit exceeded for IP: ${req.ip}. Path: ${req.path}`);
         res.status(options.statusCode).send(options.message);
     }
 });
 
-// Apply the rate limiter to the /api-proxy route before the main proxy logic
+// /api-proxy: stream request body to Gemini (no body parser here)
 app.use('/api-proxy', proxyLimiter);
-
-// Proxy route for Gemini API calls (HTTP)
 app.use('/api-proxy', async (req, res, next) => {
-    console.log(req.ip);
-    // If the request is an upgrade request, it's for WebSockets, so pass to next middleware/handler
     if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
-        return next(); // Pass to the WebSocket upgrade handler
+        return next();
     }
-
-    // Handle OPTIONS request for CORS preflight
     if (req.method === 'OPTIONS') {
-        res.setHeader('Access-Control-Allow-Origin', '*'); // Adjust as needed for security
+        res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Goog-Api-Key');
-        res.setHeader('Access-Control-Max-Age', '86400'); // Cache preflight response for 1 day
+        res.setHeader('Access-Control-Max-Age', '86400');
         return res.sendStatus(200);
     }
 
-    if (req.body) { // Only log body if it exists
-        console.log("  Request Body (from frontend):", req.body);
-    }
     try {
-        // Construct the target URL by taking the part of the path after /api-proxy/
         const targetPath = req.url.startsWith('/') ? req.url.substring(1) : req.url;
         const apiUrl = `${externalApiBaseUrl}/${targetPath}`;
-        console.log(`HTTP Proxy: Forwarding request to ${apiUrl}`);
+        console.log(`HTTP Proxy: ${req.method} ${apiUrl}`);
 
-        // Prepare headers for the outgoing request
         const outgoingHeaders = {};
-        // Copy most headers from the incoming request
         for (const header in req.headers) {
-            // Exclude host-specific headers and others that might cause issues upstream
             if (!['host', 'connection', 'content-length', 'transfer-encoding', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'].includes(header.toLowerCase())) {
                 outgoingHeaders[header] = req.headers[header];
             }
         }
-
-        // Set the actual API key in the appropriate header
         outgoingHeaders['X-Goog-Api-Key'] = apiKey;
-
-        // Set Content-Type from original request if present (for relevant methods)
         if (req.headers['content-type'] && ['POST', 'PUT', 'PATCH'].includes(req.method.toUpperCase())) {
             outgoingHeaders['Content-Type'] = req.headers['content-type'];
         } else if (['POST', 'PUT', 'PATCH'].includes(req.method.toUpperCase())) {
-            // Default Content-Type to application/json if no content type for post/put/patch
             outgoingHeaders['Content-Type'] = 'application/json';
         }
-
-        // For GET or DELETE requests, ensure Content-Type is NOT sent,
-        // even if the client erroneously included it.
         if (['GET', 'DELETE'].includes(req.method.toUpperCase())) {
-            delete outgoingHeaders['Content-Type']; // Case-sensitive common practice
-            delete outgoingHeaders['content-type']; // Just in case
+            delete outgoingHeaders['Content-Type'];
+            delete outgoingHeaders['content-type'];
         }
-
-        // Ensure 'accept' is reasonable if not set
         if (!outgoingHeaders['accept']) {
             outgoingHeaders['accept'] = '*/*';
         }
-
 
         const axiosConfig = {
             method: req.method,
@@ -123,15 +96,13 @@ app.use('/api-proxy', async (req, res, next) => {
             headers: outgoingHeaders,
             responseType: 'stream',
             validateStatus: function (status) {
-                return true; // Accept any status code, we'll pipe it through
+                return true;
             },
         };
-
+        // Stream raw body (JSON or binary file) so file upload works
         if (['POST', 'PUT', 'PATCH'].includes(req.method.toUpperCase())) {
-            axiosConfig.data = req.body;
+            axiosConfig.data = req;
         }
-        // For GET, DELETE, etc., axiosConfig.data will remain undefined,
-        // and axios will not send a request body.
 
         const apiResponse = await axios(axiosConfig);
 
@@ -176,6 +147,10 @@ app.use('/api-proxy', async (req, res, next) => {
         }
     }
 });
+
+// Body parsers for non-proxy routes (must be after /api-proxy so proxy gets raw body)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const webSocketInterceptorScriptTag = `<script src="/public/websocket-interceptor.js" defer></script>`;
 
