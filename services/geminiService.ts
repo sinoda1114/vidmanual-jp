@@ -8,12 +8,30 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // Helper to generate IDs
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
+/** 本番（Cloud Run）では API キーが PLACEHOLDER でビルドされるため、プロキシ経由にする */
+function useProxy(): boolean {
+  if (typeof window === "undefined") return false;
+  const key = process.env.API_KEY ? process.env.API_KEY.trim() : "";
+  return !key || key === "PLACEHOLDER";
+}
+
+/** プロキシ経由時はアップロード応答の URL を自サーバー向けに書き換える */
+function rewriteUploadUrlIfNeeded(uploadUrl: string): string {
+  if (!useProxy() || typeof window === "undefined") return uploadUrl;
+  return uploadUrl.replace(
+    /^https:\/\/generativelanguage\.googleapis\.com/,
+    window.location.origin + "/api-proxy"
+  );
+}
+
 /**
  * Uploads a file to Google AI Studio via the File API using standard fetch.
+ * 本番では /api-proxy 経由でサーバー側の API キーを使用する。
  */
 export async function uploadFile(file: File, onProgress: (progress: number) => void): Promise<string> {
   const apiKey = process.env.API_KEY ? process.env.API_KEY.trim() : "";
-  if (!apiKey) {
+  const viaProxy = useProxy();
+  if (!viaProxy && !apiKey) {
     throw new Error("APIキーが見つかりません。");
   }
 
@@ -26,45 +44,42 @@ export async function uploadFile(file: File, onProgress: (progress: number) => v
     },
   };
 
+  const startUrl = viaProxy
+    ? "/api-proxy/upload/v1beta/files"
+    : `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`;
+
   try {
-    // 1. Initiate Resumable Upload
-    const startUploadResponse = await fetch(
-      `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: {
-          "X-Goog-Upload-Protocol": "resumable",
-          "X-Goog-Upload-Command": "start",
-          "X-Goog-Upload-Header-Content-Length": file.size.toString(),
-          "X-Goog-Upload-Header-Content-Type": contentType,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(metadata),
-        mode: "cors", // Explicitly set CORS mode
-        credentials: "omit", // Omit credentials to avoid CORS issues with wildcards
-      }
-    );
+    const startUploadResponse = await fetch(startUrl, {
+      method: "POST",
+      headers: {
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": file.size.toString(),
+        "X-Goog-Upload-Header-Content-Type": contentType,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(metadata),
+      mode: viaProxy ? "same-origin" : "cors",
+      credentials: viaProxy ? "same-origin" : "omit",
+    });
 
     if (!startUploadResponse.ok) {
       const errorText = await startUploadResponse.text();
       throw new Error(`アップロードの開始に失敗しました: ${startUploadResponse.statusText} - ${errorText}`);
     }
 
-    const uploadUrl = startUploadResponse.headers.get("X-Goog-Upload-URL");
+    let uploadUrl = startUploadResponse.headers.get("X-Goog-Upload-URL");
     if (!uploadUrl) {
       throw new Error("Gemini APIからアップロードURLを取得できませんでした。");
     }
+    uploadUrl = rewriteUploadUrlIfNeeded(uploadUrl);
+    if (!viaProxy && !uploadUrl.includes("key=")) {
+      uploadUrl = `${uploadUrl}${uploadUrl.includes("?") ? "&" : "?"}key=${apiKey}`;
+    }
 
-    // Ensure the upload URL has the API key
-    const urlWithKey = uploadUrl.includes("key=") 
-      ? uploadUrl 
-      : `${uploadUrl}${uploadUrl.includes("?") ? "&" : "?"}key=${apiKey}`;
-
-    // Simulate progress
     onProgress(10);
 
-    // 2. Upload the file content
-    const uploadResponse = await fetch(urlWithKey, {
+    const uploadResponse = await fetch(uploadUrl, {
       method: "POST",
       headers: {
         "X-Goog-Upload-Offset": "0",
@@ -72,8 +87,8 @@ export async function uploadFile(file: File, onProgress: (progress: number) => v
         "Content-Type": contentType,
       },
       body: file,
-      mode: "cors",
-      credentials: "omit",
+      mode: viaProxy ? "same-origin" : "cors",
+      credentials: viaProxy ? "same-origin" : "omit",
     });
 
     if (!uploadResponse.ok) {
@@ -87,18 +102,18 @@ export async function uploadFile(file: File, onProgress: (progress: number) => v
 
     onProgress(100);
 
-    // 3. Wait for file to be processed
+    const stateUrl = viaProxy
+      ? `/api-proxy/v1beta/${fileName}`
+      : `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`;
+
     let state = "PROCESSING";
     while (state === "PROCESSING") {
       await delay(2000);
       try {
-        const stateResponse = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`,
-          { 
-            mode: "cors",
-            credentials: "omit" 
-          }
-        );
+        const stateResponse = await fetch(stateUrl, {
+          mode: viaProxy ? "same-origin" : "cors",
+          credentials: viaProxy ? "same-origin" : "omit",
+        });
         if (!stateResponse.ok) {
            // If we can't check state, we might just assume it's still processing or fail? 
            // Let's retry on next loop unless it's a 4xx
@@ -137,11 +152,15 @@ export async function generateManualFromVideo(
   fileMimeType: string
 ): Promise<ManualData> {
   const apiKey = process.env.API_KEY ? process.env.API_KEY.trim() : "";
-  if (!apiKey) {
+  const viaProxy = useProxy();
+  if (!viaProxy && !apiKey) {
     throw new Error("APIキーが見つかりません。");
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  const ai = new GoogleGenAI({
+    apiKey: viaProxy ? " " : apiKey,
+    ...(viaProxy && typeof window !== "undefined" && { httpOptions: { baseUrl: window.location.origin + "/api-proxy" } }),
+  });
   
   const prompt = `
     Analyze the uploaded video to create a step-by-step procedure manual in ${language}.
@@ -232,11 +251,15 @@ export async function translateManual(
   targetLanguage: string
 ): Promise<ManualData> {
   const apiKey = process.env.API_KEY ? process.env.API_KEY.trim() : "";
-  if (!apiKey) {
+  const viaProxy = useProxy();
+  if (!viaProxy && !apiKey) {
     throw new Error("APIキーが見つかりません。");
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  const ai = new GoogleGenAI({
+    apiKey: viaProxy ? " " : apiKey,
+    ...(viaProxy && typeof window !== "undefined" && { httpOptions: { baseUrl: window.location.origin + "/api-proxy" } }),
+  });
   
   const dataForTranslation = {
     title: data.title,
