@@ -65,9 +65,31 @@ app.use('/api-proxy', async (req, res, next) => {
         return res.sendStatus(200);
     }
 
+    // #region agent log
+    const debugPayload = {
+        location: 'server.js:api-proxy',
+        message: 'Proxy request',
+        data: {
+            method: req.method,
+            url: req.url,
+            contentType: req.headers['content-type'],
+            contentLength: req.headers['content-length'],
+            hypothesisId: 'H2_H3_H5',
+        },
+        timestamp: Date.now(),
+        runId: 'proxy-upload',
+    };
+    fetch('http://127.0.0.1:7247/ingest/98560d42-bda4-466e-800a-b2a3e63b3d2e', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(debugPayload) }).catch(() => {});
+    console.log('[DEBUG] Proxy req:', req.method, req.url, 'Content-Type:', req.headers['content-type'], 'Content-Length:', req.headers['content-length']);
+    // #endregion
+
     try {
         const targetPath = req.url.startsWith('/') ? req.url.substring(1) : req.url;
-        const apiUrl = `${externalApiBaseUrl}/${targetPath}`;
+        let apiUrl = `${externalApiBaseUrl}/${targetPath}`;
+        if (apiKey) {
+            const sep = apiUrl.includes('?') ? '&' : '?';
+            apiUrl = `${apiUrl}${sep}key=${encodeURIComponent(apiKey)}`;
+        }
         console.log(`HTTP Proxy: ${req.method} ${apiUrl}`);
 
         const outgoingHeaders = {};
@@ -89,6 +111,10 @@ app.use('/api-proxy', async (req, res, next) => {
         if (!outgoingHeaders['accept']) {
             outgoingHeaders['accept'] = '*/*';
         }
+
+        // #region agent log
+        console.log('[DEBUG] Outgoing headers:', JSON.stringify({ 'Content-Type': outgoingHeaders['Content-Type'], 'Content-Length': outgoingHeaders['Content-Length'], 'X-Goog-Api-Key': outgoingHeaders['X-Goog-Api-Key'] ? '(set)' : '(missing)' }));
+        // #endregion
 
         const axiosConfig = {
             method: req.method,
@@ -112,6 +138,24 @@ app.use('/api-proxy', async (req, res, next) => {
         }
         res.status(apiResponse.status);
 
+        // #region agent log
+        if (apiResponse.status >= 400) {
+            const chunks = [];
+            apiResponse.data.on('data', (c) => chunks.push(c));
+            apiResponse.data.on('end', () => {
+                const body = Buffer.concat(chunks).toString('utf8');
+                console.log('[DEBUG] Upstream error', apiResponse.status, 'body:', body);
+                if (!res.headersSent) res.setHeader('Content-Type', apiResponse.headers['content-type'] || 'application/json');
+                res.send(body);
+            });
+            apiResponse.data.on('error', (err) => {
+                console.error('[DEBUG] Upstream stream error:', err);
+                if (!res.headersSent) res.status(500).json({ error: 'Proxy stream error' });
+                else res.end();
+            });
+            return;
+        }
+        // #endregion
 
         apiResponse.data.on('data', (chunk) => {
             res.write(chunk);
