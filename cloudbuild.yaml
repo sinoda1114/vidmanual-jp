@@ -1,0 +1,20 @@
+# Cloud Build: ビルドして Artifact Registry に push（Cloud Run デプロイは別コマンドで実行）
+# 初回のみ: gcloud auth configure-docker REGION-docker.pkg.dev
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/vidmanual-jp:${SHORT_SHA}'
+      - '.'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/vidmanual-jp:${SHORT_SHA}'
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/vidmanual-jp:${SHORT_SHA}'
+options:
+  logging: CLOUD_LOGGING_ONLY
+substitutions:
+  _REGION: 'asia-northeast1'
+  _REPOSITORY: 'cloud-run-source-deploy'
